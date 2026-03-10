@@ -29,8 +29,8 @@ SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MAX_RETRIES = 5
 RETRY_WAIT_BUFFER = 5  # APIが指定する待機時間に加算する余裕秒数
 
-# レスポンスの最大トークン数（JSON肥大化防止）
-MAX_OUTPUT_TOKENS = 8192
+# レスポンスの最大トークン数（モデルの上限に合わせる）
+MAX_OUTPUT_TOKENS = 65536
 
 
 # -------------------------
@@ -55,7 +55,7 @@ def get_image_size(image_path: Path) -> tuple[int, int]:
         return img.size  # (width, height)
 
 
-def build_prompt(class_names: list[str], user_instruction: str) -> str:
+def build_prompt(class_names: list[str], user_instruction: str, max_points: int = 20) -> str:
     """Gemini に送るプロンプトを構築する"""
     classes_str = "\n".join(f"  - {i}: {name}" for i, name in enumerate(class_names))
     return f"""あなたは画像アノテーションの専門家です。
@@ -69,7 +69,7 @@ def build_prompt(class_names: list[str], user_instruction: str) -> str:
 
 ## 注意事項
 - polygon の座標は画像の幅・高さで正規化した値（0.0〜1.0）で指定してください
-- 1つのオブジェクトに対して6〜12点の頂点でポリゴンを描いてください（頂点が多すぎないように）
+- 1つのオブジェクトに対して最大{max_points}点の頂点でポリゴンを描いてください
 - 複数のオブジェクトが存在する場合はすべてアノテーションしてください
 - 対象オブジェクトが存在しない場合は annotations を空配列にしてください
 """
@@ -118,9 +118,7 @@ def annotate_image_with_retry(
     class_names: list[str],
     user_instruction: str,
 ) -> list[dict]:
-    """1枚の画像をGeminiでアノテーションする（レート制限時はリトライ）"""
-    prompt = build_prompt(class_names, user_instruction)
-
+    """1枚の画像をGeminiでアノテーションする（レート制限・JSONエラー時はリトライ）"""
     with open(image_path, "rb") as f:
         image_bytes = f.read()
 
@@ -136,7 +134,13 @@ def annotate_image_with_retry(
         max_output_tokens=MAX_OUTPUT_TOKENS,
     )
 
+    # リトライごとにポリゴン点数の上限を段階的に減らす
+    max_points_schedule = [20, 12, 8, 6, 4]
+
     for attempt in range(1, MAX_RETRIES + 1):
+        max_points = max_points_schedule[min(attempt - 1, len(max_points_schedule) - 1)]
+        prompt = build_prompt(class_names, user_instruction, max_points=max_points)
+
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -152,6 +156,7 @@ def annotate_image_with_retry(
         except Exception as e:
             error_str = str(e)
             is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            is_json_error = "json_invalid" in error_str or "EOF" in error_str or "JSONDecodeError" in error_str
 
             # 1日の上限超過は待機しても解決しないため即停止
             if is_rate_limit and "GenerateRequestsPerDay" in error_str and "limit: 0" in error_str:
@@ -168,6 +173,12 @@ def annotate_image_with_retry(
                 wait_sec += RETRY_WAIT_BUFFER
                 print(f"  レート制限 (試行 {attempt}/{MAX_RETRIES}): {wait_sec:.0f}秒待機します...")
                 time.sleep(wait_sec)
+                continue
+
+            # JSONが途中で切れた場合はポリゴン点数を減らしてリトライ
+            if is_json_error and attempt < MAX_RETRIES:
+                next_points = max_points_schedule[min(attempt, len(max_points_schedule) - 1)]
+                print(f"  JSONエラー (試行 {attempt}/{MAX_RETRIES}): ポリゴン点数を{max_points}→{next_points}に削減してリトライ...")
                 continue
 
             raise
