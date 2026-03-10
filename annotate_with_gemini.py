@@ -20,7 +20,7 @@ from PIL import Image
 
 
 # -------------------------
-# 設定っ！
+# 設定
 # -------------------------
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
