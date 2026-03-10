@@ -8,15 +8,16 @@ YOLO セグメンテーション形式:
 """
 
 import os
-import re
 import json
-import base64
+import time
 import argparse
 import shutil
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from PIL import Image
+from pydantic import BaseModel
 
 
 # -------------------------
@@ -24,11 +25,28 @@ from PIL import Image
 # -------------------------
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+# レート制限時のリトライ設定
+MAX_RETRIES = 5
+RETRY_WAIT_BUFFER = 5  # APIが指定する待機時間に加算する余裕秒数
 
-def encode_image_base64(image_path: Path) -> str:
-    """画像をbase64エンコードして返す"""
-    with open(image_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+# レスポンスの最大トークン数（JSON肥大化防止）
+MAX_OUTPUT_TOKENS = 8192
+
+
+# -------------------------
+# Pydantic スキーマ定義
+# -------------------------
+class Point(BaseModel):
+    x: float
+    y: float
+
+class Annotation(BaseModel):
+    class_id: int
+    class_name: str
+    polygon: list[Point]
+
+class AnnotationResult(BaseModel):
+    annotations: list[Annotation]
 
 
 def get_image_size(image_path: Path) -> tuple[int, int]:
@@ -49,47 +67,12 @@ def build_prompt(class_names: list[str], user_instruction: str) -> str:
 ## クラス定義
 {classes_str}
 
-## 出力形式（必ず以下のJSON形式のみで返答してください）
-```json
-{{
-  "annotations": [
-    {{
-      "class_id": 0,
-      "class_name": "クラス名",
-      "polygon": [
-        {{"x": 0.12, "y": 0.34}},
-        {{"x": 0.56, "y": 0.78}},
-        ...
-      ]
-    }}
-  ]
-}}
-```
-
 ## 注意事項
 - polygon の座標は画像の幅・高さで正規化した値（0.0〜1.0）で指定してください
-- 1つのオブジェクトに対して8〜20点程度の頂点でポリゴンを描いてください
+- 1つのオブジェクトに対して6〜12点の頂点でポリゴンを描いてください（頂点が多すぎないように）
 - 複数のオブジェクトが存在する場合はすべてアノテーションしてください
-- 対象オブジェクトが存在しない場合は "annotations": [] としてください
-- JSON以外のテキストは一切含めないでください
+- 対象オブジェクトが存在しない場合は annotations を空配列にしてください
 """
-
-
-def parse_gemini_response(response_text: str) -> list[dict]:
-    """Gemini のレスポンスからアノテーションを抽出する"""
-    # コードブロック内のJSONを抽出
-    json_match = re.search(r"```(?:json)?\s*(.*?)```", response_text, re.DOTALL)
-    if json_match:
-        json_str = json_match.group(1).strip()
-    else:
-        # コードブロックなしでJSONを探す
-        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
-        if not json_match:
-            raise ValueError(f"JSONが見つかりません:\n{response_text}")
-        json_str = json_match.group(0)
-
-    data = json.loads(json_str)
-    return data.get("annotations", [])
 
 
 def annotations_to_yolo(annotations: list[dict], img_w: int, img_h: int) -> list[str]:
@@ -108,33 +91,86 @@ def annotations_to_yolo(annotations: list[dict], img_w: int, img_h: int) -> list
 
         coords = []
         for pt in polygon:
-            x = float(pt["x"])
-            y = float(pt["y"])
-            # 0〜1の範囲にクリップ
-            x = max(0.0, min(1.0, x))
-            y = max(0.0, min(1.0, y))
+            x = max(0.0, min(1.0, float(pt["x"])))
+            y = max(0.0, min(1.0, float(pt["y"])))
             coords.extend([f"{x:.6f}", f"{y:.6f}"])
 
-        line = f"{class_id} " + " ".join(coords)
-        lines.append(line)
+        lines.append(f"{class_id} " + " ".join(coords))
     return lines
 
 
-def annotate_image(
-    model: genai.GenerativeModel,
+def extract_retry_delay(error_message: str) -> float | None:
+    """エラーメッセージからリトライ待機秒数を抽出する"""
+    import re
+    match = re.search(r"retry in (\d+(?:\.\d+)?)s", str(error_message))
+    if match:
+        return float(match.group(1))
+    match = re.search(r"seconds:\s*(\d+)", str(error_message))
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def annotate_image_with_retry(
+    client: genai.Client,
+    model_name: str,
     image_path: Path,
     class_names: list[str],
     user_instruction: str,
 ) -> list[dict]:
-    """1枚の画像をGeminiでアノテーションする"""
+    """1枚の画像をGeminiでアノテーションする（レート制限時はリトライ）"""
     prompt = build_prompt(class_names, user_instruction)
 
-    # 画像をアップロード
-    uploaded = genai.upload_file(str(image_path))
-    response = model.generate_content([prompt, uploaded])
+    with open(image_path, "rb") as f:
+        image_bytes = f.read()
 
-    annotations = parse_gemini_response(response.text)
-    return annotations
+    mime_map = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".bmp": "image/bmp", ".webp": "image/webp",
+    }
+    mime_type = mime_map.get(image_path.suffix.lower(), "image/jpeg")
+
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=AnnotationResult,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+    )
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    prompt,
+                ],
+                config=config,
+            )
+            result = AnnotationResult.model_validate_json(response.text)
+            return [ann.model_dump() for ann in result.annotations]
+
+        except Exception as e:
+            error_str = str(e)
+            is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+
+            # 1日の上限超過は待機しても解決しないため即停止
+            if is_rate_limit and "GenerateRequestsPerDay" in error_str and "limit: 0" in error_str:
+                raise RuntimeError(
+                    "1日あたりの無料枠リクエスト上限に達しました。\n"
+                    "明日以降に再試行するか、Google AI Studio で課金を有効にしてください。\n"
+                    "  https://aistudio.google.com/apikey"
+                ) from e
+
+            if is_rate_limit and attempt < MAX_RETRIES:
+                wait_sec = extract_retry_delay(error_str)
+                if wait_sec is None:
+                    wait_sec = 60 * attempt
+                wait_sec += RETRY_WAIT_BUFFER
+                print(f"  レート制限 (試行 {attempt}/{MAX_RETRIES}): {wait_sec:.0f}秒待機します...")
+                time.sleep(wait_sec)
+                continue
+
+            raise
 
 
 def save_yaml(output_dir: Path, class_names: list[str]) -> None:
@@ -158,23 +194,19 @@ def process_images(
     class_names: list[str],
     user_instruction: str,
     api_key: str,
-    model_name: str = "gemini-2.0-flash",
+    model_name: str = "gemini-2.5-flash",
     split: str = "train",
     dry_run: bool = False,
 ) -> None:
     """フォルダ内の全画像を処理してデータセットを作成する"""
 
-    # Gemini API 初期化
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+    client = genai.Client(api_key=api_key)
 
-    # 出力ディレクトリ作成
     images_out = output_dir / "images" / split
     labels_out = output_dir / "labels" / split
     images_out.mkdir(parents=True, exist_ok=True)
     labels_out.mkdir(parents=True, exist_ok=True)
 
-    # 画像ファイル一覧
     image_files = sorted(
         p for p in input_dir.iterdir()
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
@@ -201,33 +233,32 @@ def process_images(
                 print(f"  DRY RUN: スキップ (size={img_w}x{img_h})")
                 continue
 
-            # Gemini でアノテーション
-            annotations = annotate_image(model, image_path, class_names, user_instruction)
+            annotations = annotate_image_with_retry(
+                client, model_name, image_path, class_names, user_instruction
+            )
             print(f"  検出オブジェクト数: {len(annotations)}")
 
-            # YOLO形式に変換
             yolo_lines = annotations_to_yolo(annotations, img_w, img_h)
 
-            # アノテーションファイル保存
             label_path = labels_out / (image_path.stem + ".txt")
             label_path.write_text("\n".join(yolo_lines), encoding="utf-8")
 
-            # 画像をコピー
-            dest_image = images_out / image_path.name
-            shutil.copy2(image_path, dest_image)
+            shutil.copy2(image_path, images_out / image_path.name)
 
-            # アノテーション詳細を表示
             for ann in annotations:
                 print(f"  - {ann['class_name']} (class_id={ann['class_id']}, "
                       f"頂点数={len(ann['polygon'])})")
 
             success_count += 1
 
+        except RuntimeError as e:
+            print(f"\n致命的エラー: {e}")
+            break
+
         except Exception as e:
             print(f"  エラー: {e}")
             error_count += 1
 
-    # dataset.yaml を保存
     save_yaml(output_dir, class_names)
 
     print(f"\n完了: 成功={success_count}, エラー={error_count}")
@@ -239,8 +270,8 @@ def main():
         description="Gemini API で画像をアノテーションして YOLO セグメンテーション形式で保存"
     )
     parser.add_argument(
-        "--input", "-i", required=True,
-        help="入力画像フォルダのパス"
+        "--input", "-i", default="images",
+        help="入力画像フォルダのパス (デフォルト: images)"
     )
     parser.add_argument(
         "--output", "-o", default="dataset",
@@ -260,8 +291,8 @@ def main():
         help="Gemini API キー (環境変数 GEMINI_API_KEY でも指定可)"
     )
     parser.add_argument(
-        "--model", default="gemini-2.0-flash",
-        help="使用する Gemini モデル (デフォルト: gemini-2.0-flash)"
+        "--model", default="gemini-2.5-flash",
+        help="使用する Gemini モデル (デフォルト: gemini-2.5-flash)"
     )
     parser.add_argument(
         "--split", default="train", choices=["train", "val", "test"],
