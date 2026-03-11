@@ -1,0 +1,15 @@
+{
+  "_comment": "クラスごとのSAM2マスク選択戦略。戦略: max_score / min_area / max_area",
+  "default": "max_score",
+
+  "crack": "min_area",
+  "ひび割れ": "min_area",
+
+  "spalling": "max_area",
+  "欠損": "max_area",
+  "剥落": "max_area",
+
+  "stain": "max_score",
+  "汚れ": "max_score",
+  "白華": "max_score"
+}

@@ -13,6 +13,7 @@ import time
 import argparse
 import shutil
 from pathlib import Path
+from typing import Optional
 
 from google import genai
 from google.genai import types
@@ -55,13 +56,16 @@ def get_image_size(image_path: Path) -> tuple[int, int]:
         return img.size  # (width, height)
 
 
-def build_prompt(class_names: list[str], user_instruction: str, max_points: int = 20) -> str:
+def build_prompt(class_names: list[str], user_instruction: str, max_points: int = 50) -> str:
     """Gemini に送るプロンプトを構築する"""
     classes_str = "\n".join(f"  - {i}: {name}" for i, name in enumerate(class_names))
-    return f"""あなたは画像アノテーションの専門家です。
+    return f"""あなたは，材料科学，コンクリート診断，建築物診断の専門家です。
 以下の指示に従って、画像内のオブジェクトをポリゴンでアノテーションしてください。
 
-## アノテーション指示
+## 座標系の定義
+- 画像の左上を (x=0, y=0)、右下を (x=1, y=1) とします。
+
+## アノテーション指示・各指示に応じたポリゴンの描き方など
 {user_instruction}
 
 ## クラス定義
@@ -99,7 +103,7 @@ def annotations_to_yolo(annotations: list[dict], img_w: int, img_h: int) -> list
     return lines
 
 
-def extract_retry_delay(error_message: str) -> float | None:
+def extract_retry_delay(error_message: str) -> Optional[float]:
     """エラーメッセージからリトライ待機秒数を抽出する"""
     import re
     match = re.search(r"retry in (\d+(?:\.\d+)?)s", str(error_message))
@@ -135,7 +139,7 @@ def annotate_image_with_retry(
     )
 
     # リトライごとにポリゴン点数の上限を段階的に減らす
-    max_points_schedule = [20, 12, 8, 6, 4]
+    max_points_schedule = [50, 30, 20, 12, 8]
 
     for attempt in range(1, MAX_RETRIES + 1):
         max_points = max_points_schedule[min(attempt - 1, len(max_points_schedule) - 1)]
@@ -293,8 +297,12 @@ def main():
         help="クラス名のリスト (例: --classes crack spall rust)"
     )
     parser.add_argument(
-        "--instruction", required=True,
-        help="アノテーション指示（プロンプト）"
+        "--instruction",
+        help="アノテーション指示テキスト（--prompt-file と排他）"
+    )
+    parser.add_argument(
+        "--prompt-file", "-p",
+        help="アノテーション指示を記述したテキストファイルのパス（--instruction と排他）"
     )
     parser.add_argument(
         "--api-key",
@@ -323,6 +331,18 @@ def main():
             "  環境変数 GEMINI_API_KEY を設定してください。"
         )
 
+    # 指示テキストの取得（--prompt-file 優先）
+    if args.prompt_file:
+        prompt_path = Path(args.prompt_file)
+        if not prompt_path.is_file():
+            parser.error(f"プロンプトファイルが存在しません: {prompt_path}")
+        user_instruction = prompt_path.read_text(encoding="utf-8").strip()
+        print(f"プロンプトファイル: {prompt_path}")
+    elif args.instruction:
+        user_instruction = args.instruction
+    else:
+        parser.error("--instruction または --prompt-file のいずれかを指定してください。")
+
     input_dir = Path(args.input)
     if not input_dir.is_dir():
         parser.error(f"入力フォルダが存在しません: {input_dir}")
@@ -331,7 +351,7 @@ def main():
         input_dir=input_dir,
         output_dir=Path(args.output),
         class_names=args.classes,
-        user_instruction=args.instruction,
+        user_instruction=user_instruction,
         api_key=args.api_key,
         model_name=args.model,
         split=args.split,

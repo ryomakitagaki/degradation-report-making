@@ -1,7 +1,5 @@
-# YOLO Dataset Configuration
 path: /workspaces/degradation-report-making/dataset
 train: images/train
 val: images/val
-
 nc: 2
-names: ["crack", "eflo"]
+names: ['crack', 'flaking']
