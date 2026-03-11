@@ -1,210 +1,237 @@
 import os
-import io
-import math
-import time
-import shutil
-import argparse
+import cv2
+import numpy as np
+import csv
 from pathlib import Path
-from typing import List, Optional, Tuple
-
 from google import genai
 from google.genai import types
 from PIL import Image
-from pydantic import BaseModel
 
-# -------------------------
-# Pydantic スキーマ定義
-# -------------------------
-class Point(BaseModel):
-    x: float  # 0.0〜1.0 (正規化座標)
-    y: float
+# --- 1. 設定 ---
+API_KEY  = os.environ.get("GEMINI_API_KEY", "")  # 環境変数 or 直接入力
+MODEL_ID = "gemini-2.5-flash-image"
 
-class CrackAnnotation(BaseModel):
-    """ひび割れ：中心線上の点列（ポリライン）"""
-    class_name: str  # "crack"
-    points: List[Point]  # ひびの中心線を順番に追った点列
+INPUT_DIR        = Path("images")    # 入力画像フォルダ
+OUTPUT_DIR       = Path("dataset")   # 出力ルートフォルダ
+SPLIT            = "train"           # train / val / test
 
-class AnnotationResult(BaseModel):
-    cracks: List[CrackAnnotation]
-
-# -------------------------
-# 設定・定数
-# -------------------------
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-TILE_OVERLAP = 0.1  # タイル間の重なり（10%）
 
-CLASSES = {0: "crack"}
+MIME_MAP = {
+    ".png": "image/png", ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg", ".bmp": "image/bmp", ".webp": "image/webp",
+}
 
-def build_prompt(user_instruction: str) -> str:
-    return f"""あなたは材料科学およびタイル外壁診断，建物外壁診断，コンクリート診断の専門家です。
-
-## 座標系の定義
-- 画像の左上を (x=0.0, y=0.0)、右下を (x=1.0, y=1.0) とします。
-
-## crack（ひび割れ）の定義
-ひび割れとは，建材のもつ基本的な見た目とは異なる，折れ線状，亀甲状（網目状）の欠陥です．
-
-## crack（ひび割れ）の出力形式
-- ひび割れのすべての分岐点，屈曲点，始点，終端を正確に反映した詳細なトレース図を生成できるように，`points`（点群） として出力してください。
-
-## アノテーション指示
-{user_instruction}
+# --- プロンプトの設定 ---
+PROMPT_FOR_NANOBANANA = """
+このコンクリート表面の画像を解析してください。
+表面のすべてのひび割れ、特に微細なヘアクラックを網羅的に特定してください。
+特定したすべてのひび割れの上に、鮮明な赤色の線（太さ2-3ピクセル）を上書きした画像を生成してください。
+タイルの目地とひび割れを区別し、目地には赤線を引かないでください。
+元の床の色と赤線のみで構成された画像を返してください。
 """
 
 
-def polyline_to_polygon(
-    points: List[Tuple[float, float]],
-    half_w: float
-) -> Optional[List[Tuple[float, float]]]:
+# --- 2. Gemini API 初期化 ---
+client = genai.Client(api_key=API_KEY)
+
+
+def get_image_bytes(image_path: str):
+    """画像をバイト列に変換する"""
+    with open(image_path, "rb") as f:
+        return f.read()
+
+
+def generate_traced_image(model_id: str, image_path: str, prompt: str):
+    """Gemini API を呼び出してひび割れ強調画像を生成する"""
+    print("Gemini API を呼び出しています...")
+
+    image_bytes = get_image_bytes(image_path)
+    mime_type = MIME_MAP.get(Path(image_path).suffix.lower(), "image/jpeg")
+
+    response = client.models.generate_content(
+        model=model_id,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            prompt,
+        ],
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE", "TEXT"],
+        ),
+    )
+
+    # レスポンスから画像パートを取得
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            print("強調画像が生成されました。")
+            return part.inline_data.data
+
+    print("画像の生成に失敗しました。（テキスト応答のみ）")
+    return None
+
+
+def extract_point_cloud(image_bytes: bytes, csv_path: Path, vis_path: Path):
+    """生成された画像から赤色領域を検出し、点群を CSV・強調画像を保存する"""
+    print("  点群を抽出しています...")
+
+    image_np = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
+
+    # 赤色領域の検出（BGR形式）
+    lower_red = np.array([0,   0,   150])
+    upper_red = np.array([50,  50,  255])
+    mask = cv2.inRange(img, lower_red, upper_red)
+
+    # マスクされたピクセル座標を取得 (y, x)
+    points = np.column_stack(np.where(mask > 0)) if mask.any() else []
+
+    # CSV に保存
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["y", "x"])
+        if len(points):
+            writer.writerows(points)
+
+    # 強調画像を保存
+    cv2.imwrite(str(vis_path), img)
+    print(f"  → 点群 {len(points)} 点を保存: {csv_path.name}")
+    print(f"  → 強調画像を保存: {vis_path.name}")
+
+
+def csv_to_yolo(
+    csv_path: str,
+    image_path: str,
+    output_label_path: str,
+    class_id: int = 0,
+    min_area_px: int = 10,
+    approx_epsilon_ratio: float = 0.002,
+):
     """
-    ポリライン（点列）を太らせて閉じたポリゴンに変換する。
+    点群CSVを読み込み、輪郭抽出してYOLOセグメンテーション形式で保存する。
 
-    各線分の左側オフセット点列と右側オフセット点列を結合して
-    閉じたポリゴンを生成する（始点・終点は半円ではなく矩形で処理）。
+    CSVフォーマット: ヘッダー行(y,x) + ピクセル座標行
+    YOLOフォーマット: <class_id> <x1> <y1> <x2> <y2> ... (正規化座標)
     """
-    if len(points) < 2:
-        return None
+    print(f"CSV → YOLO 変換: {csv_path}")
 
-    left_pts: List[Tuple[float, float]] = []
-    right_pts: List[Tuple[float, float]] = []
+    # 元画像サイズを取得
+    with Image.open(image_path) as img:
+        W, H = img.size
 
-    for i in range(len(points)):
-        x, y = points[i]
+    # CSV から点群を読み込む
+    points = []
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            points.append((int(row["y"]), int(row["x"])))
 
-        # 接線方向を前後の点から計算
-        if i == 0:
-            dx = points[1][0] - points[0][0]
-            dy = points[1][1] - points[0][1]
-        elif i == len(points) - 1:
-            dx = points[-1][0] - points[-2][0]
-            dy = points[-1][1] - points[-2][1]
-        else:
-            dx = points[i+1][0] - points[i-1][0]
-            dy = points[i+1][1] - points[i-1][1]
+    if not points:
+        print("  点群が空です。YOLOラベルは生成されません。")
+        Path(output_label_path).write_text("")
+        return
 
-        length = math.sqrt(dx*dx + dy*dy)
-        if length < 1e-9:
+    # 点群をマスク画像に変換
+    mask = np.zeros((H, W), dtype=np.uint8)
+    for y, x in points:
+        if 0 <= y < H and 0 <= x < W:
+            mask[y, x] = 255
+
+    # モルフォロジー処理（点を繋いでひび割れ領域を閉じる）
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
+
+    # 輪郭抽出
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    yolo_lines = []
+    for contour in contours:
+        if cv2.contourArea(contour) < min_area_px:
+            continue
+        # ダグラス-ポイカー近似
+        epsilon = approx_epsilon_ratio * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if len(approx) < 3:
             continue
 
-        # 法線方向（左: +, 右: -）
-        nx = -dy / length * half_w
-        ny =  dx / length * half_w
+        coords = " ".join(
+            f"{max(0.0, min(1.0, pt[0][0] / W)):.6f} {max(0.0, min(1.0, pt[0][1] / H)):.6f}"
+            for pt in approx
+        )
+        yolo_lines.append(f"{class_id} {coords}")
 
-        left_pts.append((x + nx, y + ny))
-        right_pts.append((x - nx, y - ny))
-
-    if len(left_pts) < 2:
-        return None
-
-    # 左側 → 右側（逆順）で閉じたポリゴンを作る
-    polygon = left_pts + list(reversed(right_pts))
-    return polygon
+    Path(output_label_path).write_text("\n".join(yolo_lines))
+    print(f"  {len(yolo_lines)} 個のポリゴンを検出")
+    print(f"  YOLOラベルを保存: {output_label_path}")
 
 
-def make_tiles(image: Image.Image, grid_cols: int, grid_rows: int) -> List[Tuple[bytes, float, float, float, float]]:
-    """画像をタイルに分割し、元画像に対する位置情報を返す"""
-    W, H = image.size
-    step_x = W / grid_cols
-    step_y = H / grid_rows
-    ovlp_x = step_x * TILE_OVERLAP
-    ovlp_y = step_y * TILE_OVERLAP
-
-    tiles = []
-    for row in range(grid_rows):
-        for col in range(grid_cols):
-            x0 = max(0, int(col * step_x - ovlp_x))
-            y0 = max(0, int(row * step_y - ovlp_y))
-            x1 = min(W, int((col + 1) * step_x + ovlp_x))
-            y1 = min(H, int((row + 1) * step_y + ovlp_y))
-
-            tile = image.crop((x0, y0, x1, y1))
-            buf = io.BytesIO()
-            tile.save(buf, format="JPEG", quality=95)
-            tiles.append((buf.getvalue(), x0/W, y0/H, (x1-x0)/W, (y1-y0)/H))
-    return tiles
-
-def process_images(args):
-    client = genai.Client(api_key=args.api_key)
-    input_dir = Path(args.input)
-    output_dir = Path(args.output)
-    half_w = args.crack_width / 2.0
-
-    img_out = output_dir / "images" / args.split
-    lbl_out = output_dir / "labels" / args.split
-    img_out.mkdir(parents=True, exist_ok=True)
-    lbl_out.mkdir(parents=True, exist_ok=True)
-
-    image_files = sorted([p for p in input_dir.iterdir() if p.suffix.lower() in SUPPORTED_EXTENSIONS])
-    print(f"{len(image_files)} 枚の画像を {args.model} で処理します (Tile: {args.tile_grid}, crack_width: {args.crack_width})")
-
-    cols, rows = map(int, args.tile_grid.split('x'))
-
-    for img_path in image_files:
-        print(f"Processing: {img_path.name}")
-        with Image.open(img_path) as img:
-            tiles = make_tiles(img, cols, rows)
-
-        yolo_lines = []
-        for idx, (tile_bytes, ox, oy, sx, sy) in enumerate(tiles):
-            try:
-                response = client.models.generate_content(
-                    model=args.model,
-                    contents=[
-                        types.Part.from_bytes(data=tile_bytes, mime_type="image/jpeg"),
-                        build_prompt(args.instruction)
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=AnnotationResult,
-                    )
-                )
-
-                result = AnnotationResult.model_validate_json(response.text)
-
-                # --- crack: ポリライン → 太らせてポリゴンに変換 ---
-                for crack in result.cracks:
-                    # タイル内座標 → 元画像座標に変換
-                    global_pts = [
-                        (ox + pt.x * sx, oy + pt.y * sy)
-                        for pt in crack.points
-                    ]
-                    polygon = polyline_to_polygon(global_pts, half_w)
-                    if polygon and len(polygon) >= 3:
-                        coords = " ".join(
-                            f"{max(0.0, min(1.0, x)):.6f} {max(0.0, min(1.0, y)):.6f}"
-                            for x, y in polygon
-                        )
-                        yolo_lines.append(f"0 {coords}")
-
-                print(f"  Tile {idx+1}/{len(tiles)}: {len(result.cracks)} cracks")
-                time.sleep(0.5)  # Rate limit 対策
-
-            except Exception as e:
-                print(f"  Error in tile {idx}: {e}")
-
-        (lbl_out / f"{img_path.stem}.txt").write_text("\n".join(yolo_lines))
-        shutil.copy2(img_path, img_out / img_path.name)
-
-    yaml_content = f"path: {output_dir.resolve()}\ntrain: images/train\nval: images/val\nnc: {len(CLASSES)}\nnames: {list(CLASSES.values())}"
-    (output_dir / "dataset.yaml").write_text(yaml_content)
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", "-i", default="images")
-    parser.add_argument("--output", "-o", default="dataset")
-    parser.add_argument("--instruction", default="")
-    parser.add_argument("--api-key", default=os.environ.get("GEMINI_API_KEY", ""))
-    parser.add_argument("--split", default="train")
-    parser.add_argument("--tile-grid", default="2x2")
-    parser.add_argument("--model", default="gemini-2.5-pro")
-    parser.add_argument("--crack-width", type=float, default=0.005,
-                        help="ひび割れポリゴンの太さ（正規化座標、デフォルト: 0.005 = 画像幅の0.5%%）")
-    args = parser.parse_args()
-
-    if not args.api_key:
-        parser.error("--api-key または環境変数 GEMINI_API_KEY を設定してください。")
-
-    process_images(args)
-
+# --- メイン処理 ---
 if __name__ == "__main__":
-    main()
+    if not API_KEY:
+        raise ValueError("API_KEY が設定されていません。環境変数 GEMINI_API_KEY を設定してください。")
+
+    # 出力フォルダを作成
+    img_out = OUTPUT_DIR / "images" / SPLIT
+    lbl_out = OUTPUT_DIR / "labels" / SPLIT
+    vis_out = OUTPUT_DIR / "visualized"
+    csv_out = OUTPUT_DIR / "pointclouds"
+    for d in [img_out, lbl_out, vis_out, csv_out]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # 入力画像一覧
+    image_files = sorted(
+        p for p in INPUT_DIR.iterdir()
+        if p.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
+    if not image_files:
+        raise FileNotFoundError(f"画像が見つかりません: {INPUT_DIR}")
+
+    print(f"\n{len(image_files)} 枚の画像を処理します (model: {MODEL_ID})")
+    print(f"出力先: {OUTPUT_DIR}\n")
+
+    success, errors = 0, 0
+
+    for i, img_path in enumerate(image_files, 1):
+        print(f"[{i}/{len(image_files)}] {img_path.name}")
+        try:
+            # Step 1: Gemini で強調画像を生成
+            traced_bytes = generate_traced_image(MODEL_ID, str(img_path), PROMPT_FOR_NANOBANANA)
+
+            if traced_bytes is None:
+                print("  強調画像の生成に失敗しました。スキップします。")
+                errors += 1
+                continue
+
+            # Step 2: 赤色検出 → CSV・強調画像を保存
+            csv_path = csv_out / (img_path.stem + ".csv")
+            vis_path = vis_out / (img_path.stem + "_visualized.jpg")
+            extract_point_cloud(traced_bytes, csv_path, vis_path)
+
+            # Step 3: CSV → YOLO ラベル変換
+            label_path = lbl_out / (img_path.stem + ".txt")
+            csv_to_yolo(
+                csv_path=str(csv_path),
+                image_path=str(img_path),
+                output_label_path=str(label_path),
+            )
+
+            # 元画像をコピー
+            import shutil
+            shutil.copy2(img_path, img_out / img_path.name)
+
+            success += 1
+
+        except Exception as e:
+            print(f"  エラー: {e}")
+            errors += 1
+
+    # dataset.yaml を保存
+    yaml_content = (
+        f"path: {OUTPUT_DIR.resolve()}\n"
+        f"train: images/train\nval: images/val\n"
+        f"nc: 1\nnames: ['crack']"
+    )
+    (OUTPUT_DIR / "dataset.yaml").write_text(yaml_content)
+
+    print(f"\n完了: 成功={success}, エラー={errors}")
+    print(f"データセット: {OUTPUT_DIR}")
