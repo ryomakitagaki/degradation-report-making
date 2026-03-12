@@ -1,14 +1,45 @@
 
-# annotate_with_gemini_sam2.py の使い方
+# 建築物劣化アノテーション自動生成ツール
 
-Gemini API で劣化箇所の点座標を検出し、SAM 2 で精密なセグメンテーションを行い、YOLO セグメンテーション形式で保存するスクリプト。
+Gemini の画像生成 API を使って建築物のひび割れを検出し、YOLO セグメンテーション形式のアノテーションを自動生成するツール。
 
 ## 処理フロー
 
-1. Gemini API → 劣化箇所のプロンプト点（中心付近の座標）を出力
-2. SAM 2（ローカル）→ 点をプロンプトとして精密マスクを生成
-3. マスク → ポリゴン変換（OpenCV findContours）
-4. YOLO セグメンテーション形式で保存
+```
+入力画像
+  │
+  ▼
+[1] Gemini API（gemini-2.5-flash-image）
+    ひび割れを赤線で上書きした画像を生成
+  │
+  ▼
+[2] 赤色領域検出（OpenCV）
+    赤色ピクセル座標を点群 CSV として保存
+  │
+  ▼
+[3] 点群 → YOLO ラベル変換
+    モルフォロジー処理 → 輪郭抽出 → 正規化座標
+  │
+  ▼
+dataset/ （YOLOデータセット）
+```
+
+## ファイル構成
+
+```
+.
+├── annotate2_with_gemini.py    # メインスクリプト（アノテーション生成）
+├── visualize_annotations.py    # アノテーション可視化スクリプト
+├── requirements_annotate.txt   # 依存パッケージ
+├── images/                     # 入力画像フォルダ
+├── _original_images/           # 元画像のバックアップ
+└── dataset/                    # 出力データセット
+    ├── images/train/           # 画像（YOLOデータセット用）
+    ├── labels/train/           # YOLOラベル (.txt)
+    ├── pointclouds/            # 点群 CSV（中間ファイル）
+    ├── visualized/             # Gemini 生成の強調画像
+    └── dataset.yaml            # YOLO 用データセット設定
+```
 
 ## 事前準備
 
@@ -20,91 +51,68 @@ pip install -r requirements_annotate.txt
 
 ### 2. API キーの設定
 
-ターミナルで以下を実行しておく（セッションごとに必要）：
-
 ```bash
 export GEMINI_API_KEY="自分のAPIキー"
 ```
 
-## 基本的な使い方
+## 使い方
+
+### アノテーション生成
+
+スクリプト冒頭の設定を確認・編集してから実行：
 
 ```bash
-python annotate_with_gemini_sam2.py \
-  --classes <クラス名> \
-  --prompt-file <プロンプトファイル> \
-  --input <入力画像フォルダ> \
-  --output <出力フォルダ>
+python annotate2_with_gemini.py
 ```
 
-## オプション一覧
+**主な設定項目（スクリプト内）：**
 
-| オプション | 短縮形 | デフォルト | 説明 |
-|---|---|---|---|
-| `--input` | `-i` | `images` | 入力画像フォルダ |
-| `--output` | `-o` | `dataset` | 出力データセットフォルダ |
-| `--classes` | `-c` | （必須） | クラス名（複数指定可） |
-| `--prompt-file` | `-p` | — | アノテーション指示テキストファイル |
-| `--instruction` | — | — | アノテーション指示テキスト（直接入力） |
-| `--api-key` | — | 環境変数から取得 | Gemini API キー |
-| `--gemini-model` | — | `gemini-2.5-flash` | Gemini モデル名 |
-| `--sam2-model` | — | `tiny` | SAM 2 モデルサイズ（tiny / small / base_plus / large） |
-| `--split` | — | `train` | データセット分割（train / val / test） |
-| `--dry-run` | — | — | API 呼び出しなしで動作確認のみ |
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `MODEL_ID` | `gemini-2.5-flash-image` | 使用する Gemini モデル |
+| `INPUT_DIR` | `images` | 入力画像フォルダ |
+| `OUTPUT_DIR` | `dataset` | 出力データセットフォルダ |
+| `SPLIT` | `train` | データセット分割 |
+| `PROMPT_FOR_NANOBANANA` | `V1`（強め） | 使用するプロンプト |
 
-## 使用例
+**プロンプトの切り替え：**
+- `PROMPT_FOR_NANOBANANA_V1` — ヘアクラックも網羅的に検出（強め）
+- `PROMPT_FOR_NANOBANANA_V2` — 明確なひび割れのみ検出（弱め）
 
-### ひび割れのアノテーション
+### アノテーション可視化
+
+生成されたアノテーションを元画像に重ねて確認：
 
 ```bash
-python annotate_with_gemini_sam2.py \
-  --classes crack \
-  --prompt-file prompts/crack.txt \
-  --input images \
-  --output dataset
+python visualize_annotations.py
 ```
 
-### 複数クラスのアノテーション
+**オプション：**
+
+| オプション | デフォルト | 説明 |
+|---|---|---|
+| `--dataset` | `dataset` | データセットフォルダ |
+| `--output` | `visualized` | 出力フォルダ |
+| `--split` | `train` | 処理する split |
+| `--alpha` | `0.35` | 塗りつぶしの透明度（0.0〜1.0） |
 
 ```bash
-python annotate_with_gemini_sam2.py \
-  --classes crack spalling stain \
-  --prompt-file prompts/multi_defect.txt \
-  --input images \
-  --output dataset
+python visualize_annotations.py --dataset dataset --output visualized --alpha 0.4
 ```
 
-### SAM 2 モデルを large に変更して精度を上げる
+## 出力フォーマット
 
-```bash
-python annotate_with_gemini_sam2.py \
-  --classes crack \
-  --prompt-file prompts/crack.txt \
-  --sam2-model large
+**YOLO セグメンテーション形式：**
 ```
-
-### 動作確認（API 呼び出しなし）
-
-```bash
-python annotate_with_gemini_sam2.py \
-  --classes crack \
-  --prompt-file prompts/crack.txt \
-  --dry-run
+<class_id> <x1> <y1> <x2> <y2> ...
 ```
+座標は画像サイズで正規化（0.0〜1.0）。
 
-## 出力
-
+**dataset.yaml：**
+```yaml
+path: /path/to/dataset
+train: images/train
+val: images/val
+nc: 1
+names: ['crack']
 ```
-dataset/
-├── images/
-│   └── train/       # 入力画像のコピー
-├── labels/
-│   └── train/       # YOLO セグメンテーション形式のアノテーション (.txt)
-└── dataset.yaml     # YOLO 用データセット設定ファイル
-```
-
-## プロンプトファイル
-
-`prompts/` フォルダにアノテーション指示テキストを置く。
-
-- `prompts/crack.txt` — ひび割れ用
-- `prompts/multi_defect.txt` — 複数劣化クラス用
