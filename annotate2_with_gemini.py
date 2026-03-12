@@ -9,7 +9,7 @@ from PIL import Image
 
 # --- 1. 設定 ---
 API_KEY  = os.environ.get("GEMINI_API_KEY", "")  # 環境変数 or 直接入力
-MODEL_ID = "gemini-2.5-flash-image"  # gemini-2.5-flash-image, gemini-3.1-flash-image-preview
+MODEL_ID = "gemini-3-pro-image-preview"  # gemini-2.5-flash-image, gemini-3.1-flash-image-preview, gemini-3-pro-image-preview
 
 
 INPUT_DIR        = Path("images")    # 入力画像フォルダ
@@ -28,21 +28,30 @@ PROMPT_FOR_NANOBANANA_V1 = """
 写真にうつる建築物の表面を解析してください。
 表面のすべてのひび割れ、特に微細なヘアクラックを網羅的に特定してください。
 特定したすべてのひび割れの上に、鮮明な赤色の線（太さ2-3ピクセル）を上書きした画像を生成してください。
-直線的な目地や建材の稜線には赤線を引かないでください。
+直線的な線は目地や建材の稜線である可能性が高いので、赤線を引かないでください。
 元の画像と赤線のみで構成された画像を返してください。
 """
 
 # --- プロンプトの設定 ひび割れ検出弱め ---
 PROMPT_FOR_NANOBANANA_V2 = """
 写真にうつる建築物の表面を解析してください。
-表面のすべてのひび割れに特定してください。
+表面のすべてのひび割れを特定してください。
+特定したすべてのひび割れの上に、鮮明な赤色の線（太さ2-3ピクセル）を上書きした画像を生成してください。
+直線的な目地や建材の稜線には赤線を引かないでください。
+元の画像と赤線のみで構成された画像を返してください。
+"""
+
+# --- プロンプトの設定 ひび割れ検出もっと弱め ---
+PROMPT_FOR_NANOBANANA_V3 = """
+写真にうつる建築物の表面を解析してください。
+表面のすべてのひび割れを特定してください。
 特定したすべてのひび割れの上に、鮮明な赤色の線（太さ2-3ピクセル）を上書きした画像を生成してください。
 直線的な目地や建材の稜線には赤線を引かないでください。
 元の画像と赤線のみで構成された画像を返してください。
 """
 
 # --- プロンプトの設定 上から選ぶ---
-PROMPT_FOR_NANOBANANA = PROMPT_FOR_NANOBANANA_V1
+PROMPT_FOR_NANOBANANA = PROMPT_FOR_NANOBANANA_V2
 
 
 # --- 2. Gemini API 初期化 ---
@@ -70,6 +79,24 @@ def generate_traced_image(model_id: str, image_path: str, prompt: str):
         ],
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
+            safety_settings=[
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HATE_SPEECH",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HARASSMENT",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                    threshold="BLOCK_NONE",
+                ),
+            ],
         ),
     )
 
